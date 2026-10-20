@@ -59,5 +59,141 @@ Or `newRate = oldRate × (1 + r)^elapsed` using `r = per-second` truncated to a 
 
 ## POC
 
+Please add below test in `test/poc/PoC_S1F1_SimpleInterest.t.sol` and run `forge test --match-contract PoC_S1F1_SimpleInterest -vvv`
 
+```solidity
+// SPDX-License-Identifier: UNLICENSED
+pragma solidity ^0.8.30;
+
+import {console} from "forge-std/console.sol";
+import {V4VaultLocalBase} from "test/vault/support/V4VaultLocalBase.sol";
+import {InterestRateModel} from "src/vault/InterestRateModel.sol";
+
+/// @title PoC — S1-F1: Simple interest under-compounds over long inactive periods
+///
+/// @notice FINDING
+///   `V4Vault._calculateGlobalInterest` accrues linearly within a single window:
+///       newRate = oldRate * (1 + elapsed * rPerSec / Q64)
+///   It does not compound, has no per-window cap, and no documented requirement
+///   that the vault be touched frequently. The gap versus a sequence of smaller
+///   accrual windows is (e^(rt) - 1 - rt), which scales quadratically in r * t.
+///
+/// @notice REGRESSION MARKER
+///   Both tests PASS while the bug is present and FAIL once
+///   `_calculateGlobalInterest` compounds correctly. When fixed:
+///     - Test 1: `simple == compound` (within dust) under the deployed config.
+///     - Test 2: `simple == compound` (within dust) under the max config.
+///   Update the assertion bodies accordingly.
+///
+/// @dev Inherits `V4VaultLocalBase`: fork-free, real PoolManager/PositionManager,
+///      mock oracle, mock asset, zero-rate InterestRateModel by default. This PoC
+///      overrides the rate model per test so the simple-vs-compound gap is
+///      observable within a practical runtime.
+contract PoC_S1F1_SimpleInterest is V4VaultLocalBase {
+    uint256 constant Q64 = 2 ** 64;
+
+    // ---------------------------------------------------------------- configs
+
+    /// @dev Matches `script/DeployMainnet.s.sol`:
+    ///      base = 0%, multiplier = 5%, jump = 109%, kink = 80%.
+    function _installDeployedRate() internal {
+        InterestRateModel(address(vault.interestRateModel())).setValues(
+            0,
+            Q64 * 5 / 100,
+            Q64 * 109 / 100,
+            Q64 * 80 / 100
+        );
+    }
+
+    /// @dev Max permitted by `setValues`:
+    ///      base = 10%, multiplier = 200%, jump = 200%, kink = 0.
+    ///      NOT the deployed config; demonstrates the mechanism at a short horizon.
+    function _installMaxRate() internal {
+        InterestRateModel(address(vault.interestRateModel())).setValues(
+            Q64 / 10, Q64 * 2, Q64 * 2, 0
+        );
+    }
+
+    // ---------------------------------------------------------------- helper
+
+    /// @dev Returns (simple, compound, initial) for one untouched window vs
+    ///      daily-touched windows over the same total wall-clock time.
+    ///      Uses `vm.snapshot` / `vm.revertTo` so both paths start from the same
+    ///      post-borrow state.
+    function _measureGap(uint256 daysElapsed)
+        internal
+        returns (uint256 debtSimple, uint256 debtCompound, uint256 debtInitial)
+    {
+        // Stage: deposit, mint collateral, borrow to 80% util against the mock value.
+        _deposit(lender, 1000e18);
+        oracle.setMockPositionValue(1000e18);
+        uint256 tokenId = _createLoan(uint128(1000e18));
+        _borrow(tokenId, 800e18);
+        (debtInitial,,,,) = vault.loanInfo(tokenId);
+
+        uint32 rf = vault.reserveFactorX32();
+        uint256 startTs = block.timestamp;
+        uint256 snap = vm.snapshot();
+
+        // A) untouched: one accrual covers the whole window, linear formula.
+        vm.warp(startTs + daysElapsed * 1 days);
+        vault.setReserveFactor(rf); // any state-changing call triggers _updateGlobalInterest
+        (debtSimple,,,,) = vault.loanInfo(tokenId);
+
+        // B) compounded: same wall-clock, one accrual per day.
+        vm.revertTo(snap);
+        vm.warp(startTs); // safety net: some forge versions need this after revertTo
+        for (uint256 i = 0; i < daysElapsed; i++) {
+            vm.warp(startTs + (i + 1) * 1 days);
+            vault.setReserveFactor(rf);
+        }
+        (debtCompound,,,,) = vault.loanInfo(tokenId);
+    }
+
+    // ---------------------------------------------------------------- test 1
+
+    /// @notice Deployed mainnet config, 5 years untouched.
+    /// @dev Passes while the bug is present. At the deployed config this is the
+    ///      minimum horizon where the linear-vs-compound gap is material.
+    function test_RegressionMarker_DeployedConfig_LongGap() public {
+        _installDeployedRate();
+
+        (uint256 simple, uint256 compound, uint256 initial) = _measureGap(5 * 365);
+
+        console.log("== deployed config, 5 years untouched ==");
+        console.log("Initial debt:    ", initial);
+        console.log("Simple  (buggy): ", simple);
+        console.log("Compound expect: ", compound);
+        console.log("Gap absolute:    ", compound - simple);
+        console.log("Gap % of debt:   ", (compound - simple) * 100 / initial);
+
+        // REGRESSION MARKER: bug present -> simple < compound. Fix -> equal within dust.
+        assertLt(simple, compound, "BUG: untouched accrual under-charges vs compounding");
+        // Materiality: gap is >1% of initial debt under the deployed config at 5y untouched.
+        assertGt(compound - simple, initial / 100, "BUG: gap is >1% of debt at 5y untouched");
+    }
+
+    // ---------------------------------------------------------------- test 2
+
+    /// @notice Max permitted config, 30 days untouched.
+    /// @dev Passes while the bug is present. Demonstrates the mechanism without
+    ///      requiring the long horizon test 1 needs under the deployed config.
+    function test_RegressionMarker_MaxConfig_MechanismAt30Days() public {
+        _installMaxRate();
+
+        (uint256 simple, uint256 compound, uint256 initial) = _measureGap(30);
+
+        console.log("== max config, 30 days untouched ==");
+        console.log("Initial debt:    ", initial);
+        console.log("Simple  (buggy): ", simple);
+        console.log("Compound expect: ", compound);
+        console.log("Gap absolute:    ", compound - simple);
+
+        // REGRESSION MARKER: bug present -> simple < compound. Fix -> equal within dust.
+        assertLt(simple, compound, "BUG: linear accrual under-charges vs compounding");
+        // Materiality under max config at 30 days.
+        assertGt(compound - simple, initial / 1000, "BUG: gap >0.1% of debt at max config");
+    }
+}
+```
 
